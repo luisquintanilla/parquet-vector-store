@@ -265,21 +265,84 @@ per-file detail):
    `CosineSimilarity`), rejects key `0` (vec0 rowid), and has very slow ingest — papercuts an app
    moving across tiers hits.
 
-**A plan to fill them.**
+**A plan to fill them — and why each one matters.**
 
-- **Runtime asks:** a fused `Half` dot reduction; an exposed managed VNNI path for int8; and a
-  tiled GEMM/GEMV helper (or a documented row-stationary recipe) so the compute-bound regime is not
-  hand-rolled per project.
-- **Tensor ergonomics:** a parallel-friendly way to map a contiguous tensor's rows across cores
-  without re-acquiring spans by hand.
-- **Data path:** a columnar Parquet bulk-load that fills a contiguous `float[]`/`Tensor<float>`
-  directly, skipping per-row POCO materialization.
-- **A first-class Parquet-backed MEVD provider:** productize `02` (columnar load + the write path
-  here + optional fp16/int8 quantization) so Tier 0/1 has a no-dependency, durable, swappable store.
-- **A faster in-box brute force:** apply the packing + parallel partial-top-k here to
-  `InMemoryCollection` (or ship it alongside) so the default store is not ~2-5x off.
-- **Use this repo as the evidence:** every claim above is a runnable file with numbers on commodity
-  hardware, so the asks are concrete and measured rather than aspirational.
+First, why these are worth filling at all. Brute-force vector search is **memory-bandwidth bound**
+(every query streams the whole matrix once), so only two levers actually move the needle: **fewer
+bytes per vector** (fp16 ~2x, int8 ~4x, binary up to ~32x smaller) and **reusing the matrix read
+across queries** (batch them into a GEMM). Neither is academic — the embeddings already arrive
+quantized: Cohere Embed v3/v4 return
+[int8 and binary natively](https://cohere.com/blog/int8-binary-embeddings), and the technique is
+[documented and mainstream](https://huggingface.co/blog/embedding-quantization). The blockers below
+are why managed .NET can't fully cash those bytes in yet. The stakes are concrete: **cost per query,
+vectors-per-GB of RAM, queries-per-second, cold-start latency, edge/on-device feasibility, and
+power.**
+
+- **A fused `Half` (fp16) dot reduction.** *The problem:* storing vectors as fp16 should halve DRAM
+  traffic — doubling both throughput and how many vectors fit per GB, a direct cost lever for RAG at
+  scale. But with no fused fp16 reduction you must widen to float first (a separate pass that reads
+  the data twice), which erases the saving, so managed code can't capture fp16's bandwidth win today
+  (`05` measures it as a wash-to-loss). *Who it hurts:* anyone holding a large embedding corpus who
+  wants more vectors per GB cheaply. *Tracked upstream:* [dotnet/runtime #98820](https://github.com/dotnet/runtime/issues/98820)
+  (expose AVX-512 FP16 + F16C, api-approved), gated on [#123017](https://github.com/dotnet/runtime/issues/123017)
+  (add `TYP_HALF` to the JIT); roadmap [#120362](https://github.com/dotnet/runtime/issues/120362)
+  still has every fp16 item unchecked, targeting a future .NET.
+- **An exposed managed VNNI path for int8.** *The problem:* int8 is the single biggest measured win
+  (~4x) because it quarters bytes moved *and* uses a hardware int8 multiply-add — and int8/binary
+  embeddings are now mainstream. When a workload tips compute-bound (large batch, large index), a
+  dense VNNI MAC (`VPDPBUSD`, 32 int8 MACs per cycle) beats the two-instruction
+  `vpmaddubsw`+`vpmaddwd` workaround this repo falls back to. But .NET 10 exposes no `Avx512Vnni`
+  class, and the VEX `AvxVnni` isn't even available on common mobile CPUs (Tiger Lake / Ice Lake), so
+  managed int8 search is stuck on the slower path. *Who it hurts:* anyone running compute-bound int8
+  search or reranking on AVX-512 hardware. *Tracked upstream:* [dotnet/runtime #86849](https://github.com/dotnet/runtime/issues/86849)
+  (AVX-512 VNNI API, api-approved) with open community PR [#128365](https://github.com/dotnet/runtime/pull/128365)
+  (`AvxVnni.V512`).
+- **A tiled GEMM/GEMV helper** (or a documented row-stationary recipe). *The problem:* a single query
+  is bandwidth-bound and can't be sped up by a better kernel; the *only* way faster is to batch
+  queries into a GEMM that reads the matrix once and reuses each row — the shape of reranking,
+  offline/batch RAG evaluation, clustering, and dedup, where it drops per-query latency ~10x
+  (`03`/`04`). But `System.Numerics.Tensors` is BLAS1 by charter ([`Dot` is documented as the BLAS1
+  operation](https://learn.microsoft.com/en-us/dotnet/api/system.numerics.tensors.tensorprimitives.dot);
+  there is no matmul), so every project hand-rolls it or pulls TorchSharp (~400 MB native libtorch),
+  MKL, or OpenBLAS — native dependencies that break NativeAOT. *Who it hurts:* any .NET service doing
+  batch/offline vector work that wants to stay managed and AOT-clean. *Tracked upstream:* the
+  [Tensors-in-.NET epic #98323](https://github.com/dotnet/runtime/issues/98323) lists linear algebra
+  as a goal, but the BLAS bridge (TorchSharp/OnnxRuntime interop) is unchecked and no GEMM API is
+  proposed — so the ~30-line managed GEMM here is the stopgap.
+- **A parallel-friendly way to map a tensor's rows across cores.** *The problem:* `TensorSpan<T>` is a
+  `ref struct`, so it can't be captured in a `Parallel.For`/`ForEach` lambda; to scan a `Tensor<T>` in
+  parallel you pass the `Tensor<T>` itself into each partition and re-acquire the span by hand (this
+  repo does exactly that). A first-class row-partition helper would remove that papercut so the
+  parallel path isn't hand-rolled per project. *Who it hurts:* anyone using `Tensor<T>` as the surface
+  for parallel, row-wise work.
+- **A columnar Parquet bulk-load** that fills a contiguous `float[]`/`Tensor<float>` directly. *The
+  problem:* `ParquetSerializer.DeserializeAsync<T>` materializes one POCO per row (~6 s for 50k here)
+  and is not AOT-clean, so it dominates cold start — exactly the latency that hurts serverless and
+  edge RAG. Parquet.Net already has the lower-level columnar API (`OpenRowGroupReader` →
+  `ReadAsync<T>(DataField, Memory<float>)`) that fills a contiguous buffer with no per-row objects;
+  the ask is a first-class path that uses it for the embedding column. (The honest wrinkle: a
+  `float[]` column is stored as a Parquet *list*, so you slice on repetition-level boundaries at
+  stride `dims` — supported, just not a one-liner.) *Who it hurts:* cold-start-sensitive RAG and AOT
+  deployments.
+- **A first-class Parquet-backed MEVD provider.** *The problem:* .NET ships no vector store that is
+  durable, a single portable file, *and* free of native dependencies. `InMemoryCollection` is
+  volatile RAM (lost on restart, so you re-embed every cold start); `SqliteVec` persists to a file but
+  bundles a native C extension (and is the AI Chat Web template's local default, with the ~14-minute
+  50k ingest measured above); everything else needs a server. Productizing `02` (columnar load + the
+  write path here + optional fp16/int8) fills that hole with a durable, portable, no-dependency,
+  AOT-friendly store. *Who it hurts:* local-first, edge, and getting-started apps that just want "a
+  file" without a native dep or a server.
+- **A faster in-box brute force.** *The problem:* the default in-memory store thousands of developers
+  start RAG with is ~2-5x slower than it needs to be, for four structural reasons — records held as
+  objects in a `ConcurrentDictionary` (scattered layout), a sequential LINQ `Select` (one core),
+  per-record `CosineSimilarity` (recomputing the query norm every record), and a full `OrderBy` sort
+  (O(N log N) instead of a partial top-k). Packing, pre-normalizing, scanning in parallel, and
+  keeping a partial top-k returns the *same* neighbors several times faster (`06`). Apply that here to
+  `InMemoryCollection`, or ship it alongside. *Who it hurts:* every getting-started sample that leans
+  on the default store.
+- **Use this repo as the evidence.** Every claim above is a runnable file with numbers on commodity
+  hardware, *and* the runtime asks are already filed and tracked upstream (#98820, #86849 / #128365,
+  #98323). So these are concrete and measured, pointing at live work, not aspirational.
 
 The honest boundary: none of this replaces ANN/IVF at millions of vectors. It owns the
 **small-to-mid, no-dependency floor** — and the seam to graduate upward when you outgrow it.
