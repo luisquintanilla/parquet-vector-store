@@ -1,0 +1,9 @@
+bin/
+obj/
+*.parquet
+*.f32
+__pycache__/
+*.db
+*.db-shm
+*.db-wal
+*.done
